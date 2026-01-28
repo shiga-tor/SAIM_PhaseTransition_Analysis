@@ -1,3 +1,15 @@
+"""
+calibration_analysis.py
+
+Quality Control / Calibration Analysis Script for Muse EEG Data.
+Implements a Hybrid Logic:
+1. Validated Manual Timings for S001 (Golden Standard).
+2. Automated '59-second Rule' + Sequential Peak Detection for S002+.
+
+Author: Takafumi Shiga
+Date: 2026
+"""
+
 import numpy as np
 import pandas as pd
 import glob
@@ -8,13 +20,15 @@ from scipy.stats import linregress
 from scipy.ndimage import label
 
 # ==========================================
-# 1. 自動検出エンジン (S002以降用)
+# 1. Automated Detection Engine (For S002+)
 # ==========================================
 def detect_timings_auto(df, fs=256):
     """
-    S002以降のための自動検出ロジック
-    ルール: 59秒以降のイベントを順に Jaw -> Eye -> Blink とする
+    Automated timing detection logic for subject S002 and later.
+    Rule: Events occurring after 59 seconds are assigned sequentially:
+          Jaw -> Eye -> Blink.
     """
+    # Channel selection
     raw_cols = [c for c in df.columns if 'RAW' in c and ('TP9' in c or 'AF7' in c or 'AF8' in c or 'TP10' in c)]
     if len(raw_cols) < 4:
         alt = ['TP9', 'AF7', 'AF8', 'TP10']
@@ -24,28 +38,29 @@ def detect_timings_auto(df, fs=256):
              if match: raw_cols.append(match[0])
     if not raw_cols: return None
 
-    # データ抽出 & 補間
+    # Data extraction & Interpolation (Handle NaNs)
     data_df = df[raw_cols].interpolate(method='linear', limit_direction='both').fillna(0)
     data = data_df.values
     
-    # フィルタリング
+    # High-pass Filtering (>30Hz for EMG detection)
     b, a = butter(4, 30 / (fs/2), btype='highpass')
     try:
         filt_data = filtfilt(b, a, data, axis=0)
     except: return None
 
-    # パワー計算 (対数スケールでダイナミックレンジ圧縮)
+    # Power Calculation (Log scale to compress dynamic range)
     power = np.mean(filt_data**2, axis=1)
     power = np.maximum(power, 1e-10)
     log_power = np.log10(power)
     
+    # Smoothing
     window = int(fs * 0.5)
     smooth_log_power = pd.Series(log_power).rolling(window=window, center=True).mean().fillna(np.min(log_power)).values
     
-    # --- 59秒ルール ---
+    # --- 59-Second Rule ---
     scan_start_idx = int(fs * 59.0)
     
-    # しきい値計算 (59秒以降のデータに基づく)
+    # Threshold calculation (Based only on data after 59s)
     if len(smooth_log_power) > scan_start_idx + (fs * 5):
         ref_data = smooth_log_power[scan_start_idx:]
     else:
@@ -53,20 +68,22 @@ def detect_timings_auto(df, fs=256):
 
     floor = np.percentile(ref_data, 5)
     ceiling = np.percentile(ref_data, 99)
-    threshold = floor + (ceiling - floor) * 0.30 # 感度30%
+    threshold = floor + (ceiling - floor) * 0.30 # Sensitivity: 30%
     
+    # Binary activation detection
     is_active = smooth_log_power > threshold
     if len(is_active) > scan_start_idx:
-        is_active[:scan_start_idx] = False # 59秒以前は無視
+        is_active[:scan_start_idx] = False # Force ignore events before 59s
     
     labeled_array, num_features = label(is_active)
     
     raw_events = []
     for i in range(1, num_features+1):
         idx = np.where(labeled_array == i)[0]
-        if len(idx) > fs * 2.0:
+        if len(idx) > fs * 2.0: # Keep events longer than 2s
             raw_events.append((idx[0], idx[-1]))
     
+    # Merge events (Fill gaps smaller than 5s)
     merged_events = []
     if raw_events:
         curr_s, curr_e = raw_events[0]
@@ -80,12 +97,12 @@ def detect_timings_auto(df, fs=256):
     
     timings = {}
     
-    # Rest (固定)
+    # Rest (Fixed window: 10s to 55s)
     rest_end = 55.0
     if len(df)/fs < 55.0: rest_end = (len(df)/fs) - 5.0
     timings['Rest'] = (10.0, rest_end)
     
-    # Tasks
+    # Tasks Assignment (Sequential)
     task_order = ['Jaw', 'Eye', 'Blink']
     for i, task_name in enumerate(task_order):
         if i < len(merged_events):
@@ -99,27 +116,28 @@ def detect_timings_auto(df, fs=256):
     return timings
 
 # ==========================================
-# 2. タイミング決定ロジック (ハイブリッド)
+# 2. Timing Determination Logic (Hybrid)
 # ==========================================
 def get_timings_hybrid(df, subject_id, fs=256):
     """
-    S001なら固定値、それ以外なら自動検出を返す
+    Returns fixed timings for S001 (Ground Truth), 
+    and automated detection for all other subjects.
     """
     if subject_id == "S001":
-        # S001専用: グラフ検証済みの正解データ
+        # S001 Specific: Manually validated ground truth data
         # Jaw: 69-79s, Eye: 87-93s, Blink: 100s+
         return {
             'Rest': (10.0, 50.0),
-            'Jaw':  (71.0, 77.0), # 安定区間
+            'Jaw':  (71.0, 77.0), # Stable interval
             'Eye':  (88.0, 92.0),
             'Blink':(102.0, 108.0)
         }
     else:
-        # S002以降: 自動検出
+        # S002+: Automated detection
         return detect_timings_auto(df, fs)
 
 # ==========================================
-# 3. 共通解析クラス
+# 3. Common Analysis Class (Robust CCA)
 # ==========================================
 class RobustCCA:
     def __init__(self, n_components=4):
@@ -181,7 +199,7 @@ def verify_segment(raw_df, start_sec, end_sec, fs=256):
     return exponent
 
 # ==========================================
-# 4. メイン処理 (Production Mode)
+# 4. Main Process (Production Mode)
 # ==========================================
 def batch_process_production(file_pattern="S*_Calibration.csv", fs=256):
     files = sorted(glob.glob(file_pattern))
@@ -200,7 +218,7 @@ def batch_process_production(file_pattern="S*_Calibration.csv", fs=256):
         try:
             df = pd.read_csv(file_path)
             
-            # ★ハイブリッド判定呼び出し★
+            # ★ Call Hybrid Detection Logic ★
             timings = get_timings_hybrid(df, subj, fs)
             
             if timings is None:
@@ -224,7 +242,7 @@ def batch_process_production(file_pattern="S*_Calibration.csv", fs=256):
             
             if exp_rest is not None and exp_jaw is not None:
                 diff = exp_rest - exp_jaw
-                # 合格基準: 明確な差があること
+                # Pass Criteria: Must show significant difference
                 if diff > 0.3: status = "OK"
                 elif diff > 0.1: status = "WEAK"
                 else: status = "CHECK"
@@ -241,5 +259,6 @@ def batch_process_production(file_pattern="S*_Calibration.csv", fs=256):
 
     print("-" * 115)
 
-# 実行
-batch_process_production("S*_Calibration.csv")
+if __name__ == "__main__":
+    # Execute
+    batch_process_production("S*_Calibration.csv")
